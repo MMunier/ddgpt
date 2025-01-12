@@ -428,7 +428,7 @@ async fn main() {
     let args_parsed = Cli::parse();
     let ddgpt_config = DDGPTConfigDescription::load()
         .expect("Could not load / access / initialize the general configuration file");
-    dbg!(&args_parsed);
+    // dbg!(&args_parsed);
 
     let model_arg = args_parsed.model.unwrap_or(ddgpt_config.default_chatbot);
     let model = model_arg.to_model();
@@ -486,8 +486,8 @@ async fn main() {
         .expect("Failed to send status request");
 
     // dbg!(&ddg_status_response);
-    dbg!(&chat_history);
-    dbg!(&serde_json::to_string(&chat_history).unwrap());
+    // dbg!(&chat_history);
+    // dbg!(&serde_json::to_string(&chat_history).unwrap());
 
     if chat_history.next_vqid.is_empty() {
         chat_history.next_vqid = ddg_status_response
@@ -499,7 +499,7 @@ async fn main() {
             .to_string();
     }
 
-    dbg!(&chat_history);
+    // dbg!(&chat_history);
     let ddg_chat_request = client
         .post(Url::parse("https://duckduckgo.com/duckchat/v1/chat").unwrap())
         .header(header::ACCEPT, "text/event-stream")
