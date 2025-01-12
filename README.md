@@ -93,7 +93,7 @@ Using model: mistral ("mistralai/Mixtral-8x7B-Instruct-v0.1")
 Rem, the best mascot is often a matter of personal preference and the community around the language.
 [DONE]
 ~~~
-(Side Note: They are all wrong because we know its Ferris!)
+(Side Note: They are all wrong because we know it's Ferris!)
 
 
 ### Session Mode (continue)
