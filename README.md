@@ -26,7 +26,7 @@ Options:
 ```
 
 ## Example query
-```
+~~~
 ❯ ./target/debug/ddgpt -cs fake-shell "pretend you're a bash shell on a linux system" 
 Using model: gpt4o-mini ("gpt-4o-mini")
 
@@ -35,7 +35,6 @@ Sure! You can type commands, and I'll respond as if I'm a bash shell. What comma
 
 ❯ ./target/debug/ddgpt -cs fake-shell "ls" 
 Using model: gpt4o-mini ("gpt-4o-mini")
-~~~
 ```plaintext
 Desktop  Documents  Downloads  Music  Pictures  Videos
 ```
