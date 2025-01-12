@@ -5,18 +5,27 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
     Parser, ValueEnum,
 };
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use config::{ConfigError, ConfigLoadable};
 // use eventsource::reqwest::Client;
 use reqwest::{header, Client, Url};
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 
+mod config;
 const DIMMED: Style = Style::new().dimmed();
 
 #[derive(Debug, clap::Parser)]
 #[command(about = "A CLI interface to duckduckgo's chatbots")]
 struct Cli {
-    #[arg(short = 'm', long = "model", default_value = "gpt4o-mini", value_parser=ModelIdentArgParser())]
-    model: ModelIdentArg,
+    #[arg(short = 'm', long = "model", value_parser=ModelIdentArgParser())]
+    model: Option<ModelIdentArg>,
+
+    #[arg(short = 's', long = "session")]
+    session_name: Option<String>,
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+    #[arg(short = 'i', long = "interactive")]
+    interactive_session: bool,
+
     #[arg(
         // last = true,
         // multiple = true,
@@ -26,12 +35,18 @@ struct Cli {
     query: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum ModelIdentArg {
     GPT4oMini,
     Claude3,
     Llama3,
     Mixtral,
+}
+
+impl Default for ModelIdentArg {
+    fn default() -> Self {
+        ModelIdentArg::GPT4oMini
+    }
 }
 
 impl ModelIdentArg {
@@ -80,23 +95,6 @@ impl ValueEnum for ModelIdentArg {
                 clap::builder::PossibleValue::new(self.as_str()).alias("mixtral")
             }
         })
-    }
-
-    fn from_str(input: &str, ignore_case: bool) -> Result<Self, String> {
-        let mut input_normalized = input.to_string();
-        if !ignore_case {
-            input_normalized = input.to_lowercase();
-        }
-
-        let matcher = SkimMatcherV2::default();
-        for variant in Self::value_variants() {
-            let pattern: &'static str = variant.into();
-            let score = matcher.fuzzy_match(input_normalized.as_str(), pattern);
-
-            dbg!(score);
-        }
-
-        Err(format!("Invalid variant: {input}"))
     }
 }
 
@@ -267,6 +265,106 @@ impl<'a> ChunkParser<'a> {
     }
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct DDGPTConfigDescription {
+    default_chatbot: ModelIdentArg,
+}
+
+impl ConfigLoadable for DDGPTConfigDescription {
+    const FILENAME: &'static str = "config.toml";
+    const FILETYPE: config::ConfigFileType = config::ConfigFileType::TOML;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ChatRole {
+    Assistant,
+    User,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatMessage {
+    role: ChatRole,
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatRequest {
+    model: GPTModelIdent,
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatHistory {
+    chat: ChatRequest,
+    next_vqid: String,
+}
+
+struct PastChats {}
+impl PastChats {
+    fn load_last() -> Result<Option<ChatHistory>, ConfigError> {
+        let data_path = config::user_data_dir();
+        let dir_iter = match std::fs::read_dir(&data_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&data_path)?;
+                return Ok(None);
+            }
+            res => res,
+        }?;
+
+        let mut last_chat = None;
+        for entry_result in dir_iter {
+            let entry = entry_result?;
+            let entry_time = entry.metadata()?.modified()?;
+            match last_chat {
+                Some((_, last_chat_time)) if last_chat_time > entry_time => continue,
+                _ => last_chat = Some((entry, entry_time)),
+            }
+        }
+
+        Ok(match last_chat {
+            Some((val, _)) => Some(serde_json::from_str(&std::fs::read_to_string(val.path())?)?),
+            None => None,
+        })
+    }
+
+    fn load_session_from_name(name: &str) -> Result<Option<ChatHistory>, ConfigError> {
+        if name.contains("/") || name.contains(".") {
+            return Err(ConfigError::Io(std::io::Error::other(
+                "Invalid session name!",
+            )));
+        }
+
+        let mut data_path = config::user_data_dir();
+        data_path.push(name);
+
+        let data = match std::fs::read_to_string(&data_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            val => val,
+        }?;
+
+        Ok(Some(serde_json::from_str(&data)?))
+    }
+
+    fn save(name: &str, chat: &ChatHistory) -> Result<(), ConfigError> {
+        if name.contains("/") || name.contains(".") {
+            return Err(ConfigError::Io(std::io::Error::other(
+                "Invalid session name!",
+            )));
+        }
+
+        let mut data_path = config::user_data_dir();
+        // Ensure the directory exists!
+        std::fs::create_dir_all(&data_path)?;
+        data_path.push(name);
+
+        let chat_serialized = serde_json::to_string(chat)?;
+        std::fs::write(data_path, chat_serialized)?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct ChatBotEvent {
     action: String,
@@ -297,7 +395,7 @@ enum GPTModelIdent {
     Mixtral,
 }
 
-fn display_message_fragment(message_buffer: &[u8]) {
+fn display_message_fragment(assistant_message: &mut String, message_buffer: &[u8]) {
     let message = match message_buffer.strip_prefix(b"data: ") {
         Some(message) => message,
         None => return,
@@ -317,7 +415,9 @@ fn display_message_fragment(message_buffer: &[u8]) {
             a, message_printable
         );
     });
+
     if let Some(chat_message_fragment) = message_deserialized.message {
+        assistant_message.push_str(&chat_message_fragment);
         print!("{chat_message_fragment}");
         let _ = std::io::stdout().flush();
     }
@@ -326,27 +426,58 @@ fn display_message_fragment(message_buffer: &[u8]) {
 #[tokio::main]
 async fn main() {
     let args_parsed = Cli::parse();
-    // dbg!(&args_parsed);
+    let ddgpt_config = DDGPTConfigDescription::load()
+        .expect("Could not load / access / initialize the general configuration file");
+    dbg!(&args_parsed);
 
-    let model = args_parsed.model.to_model();
-    let query = args_parsed.query.join(" ");
+    let model_arg = args_parsed.model.unwrap_or(ddgpt_config.default_chatbot);
+    let model = model_arg.to_model();
+
     anstream::eprintln!(
         "{DIMMED}Using model: {} ({}){DIMMED:#}\n",
-        args_parsed.model.as_str(),
+        model_arg.as_str(),
         serde_json::to_string(&model).expect("Model doesn't have a valid json representation!")
     );
     let _ = std::io::stderr().flush();
+
+    let query = args_parsed.query.join(" ");
+    let mut chat_history = args_parsed
+        .continue_session
+        .then(|| {
+            if let Some(session_name) = args_parsed.session_name.as_deref() {
+                PastChats::load_session_from_name(session_name)
+            } else {
+                PastChats::load_last()
+            }
+            .expect("Failed to load the previous chat, is the data directoy accessible?")
+        })
+        .flatten()
+        .unwrap_or_else(|| ChatHistory {
+            chat: ChatRequest {
+                model: model,
+                messages: vec![],
+            },
+            next_vqid: String::new(),
+        });
+
+    chat_history.chat.messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: query,
+    });
 
     let client = Client::builder()
         .user_agent("curl/7.81.0")
         .build()
         .expect("Failed to construct http_client");
 
-    let ddg_status_request = client
-        .get("https://duckduckgo.com/duckchat/v1/status")
-        .header("x-vqd-accept", "1")
-        .build()
-        .unwrap();
+    let mut ddg_status_request = client.get("https://duckduckgo.com/duckchat/v1/status");
+
+    // We need to request a new session ID
+    if chat_history.next_vqid.is_empty() {
+        ddg_status_request = ddg_status_request.header("x-vqd-accept", "1")
+    }
+
+    let ddg_status_request = ddg_status_request.build().unwrap();
 
     // dbg!(&ddg_status_request);
     let ddg_status_response = client
@@ -355,25 +486,35 @@ async fn main() {
         .expect("Failed to send status request");
 
     // dbg!(&ddg_status_response);
+    dbg!(&chat_history);
+    dbg!(&serde_json::to_string(&chat_history).unwrap());
 
-    let header_x_vqd_4_id = ddg_status_response.headers().get("x-vqd-4").unwrap();
+    if chat_history.next_vqid.is_empty() {
+        chat_history.next_vqid = ddg_status_response
+            .headers()
+            .get("x-vqd-4")
+            .unwrap()
+            .to_str()
+            .expect("x-vqd-4 ID was not a valid UTF8-String!")
+            .to_string();
+    }
+
+    dbg!(&chat_history);
     let ddg_chat_request = client
         .post(Url::parse("https://duckduckgo.com/duckchat/v1/chat").unwrap())
         .header(header::ACCEPT, "text/event-stream")
         .header(header::CONTENT_TYPE, "application/json")
         // .header(header::COOKIE, value)
-        .header("x-vqd-4", header_x_vqd_4_id)
+        .header("x-vqd-4", &chat_history.next_vqid)
         .body(
-            json!(
-            {
-                "model": model,
-                "messages":[{"content": query, "role": "user"}]
-            })
-            .to_string(),
             // r#"{"model":"gpt-4o-mini","messages":[{"content": "foobar", "role": "user"}]}"#
+            serde_json::to_string(&chat_history.chat)
+                .expect("Failed to json-serialize the request"),
         )
         .build()
         .unwrap();
+
+    // println!("{}", serde_json::to_string_pretty(&chat_request).expect("Failed to json-serialize the request"));
 
     // dbg!(&ddg_chat_request);
     let mut ddg_chat_response = client
@@ -381,6 +522,13 @@ async fn main() {
         .await
         .expect("Failed to send chat request");
 
+    // DDG still returns 200 even on error ...
+    // if ddg_status_response.status() != 200 {
+    //     eprintln!("Error {:?}", ddg_chat_response.text().await.expect("Failed to fetch message from webserver!"));
+    //     return;
+    // }
+
+    let mut assistant_message = String::new();
     loop {
         let mut chunk_parser = ChunkParser {
             buf: vec![],
@@ -388,42 +536,60 @@ async fn main() {
         };
 
         let messages = match ddg_chat_response.chunk().await.unwrap() {
-            Some(val) => {
-                // dbg!(&val);
-                chunk_parser.update(&val)
-            }
+            Some(val) => chunk_parser.update(&val),
             None => break,
         };
 
         for message in messages {
-            display_message_fragment(&message);
+            display_message_fragment(&mut assistant_message, &message);
         }
+    }
+
+    if assistant_message != "" {
+        chat_history.next_vqid = ddg_chat_response
+            .headers()
+            .get("x-vqd-4")
+            .unwrap()
+            .to_str()
+            .expect("x-vqd-4 ID was not a valid UTF8-String!")
+            .to_string();
+
+        chat_history.chat.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            content: assistant_message,
+        });
+
+        PastChats::save(
+            args_parsed.session_name.as_deref().unwrap_or("foobar"),
+            &chat_history,
+        )
+        .expect("Failed to save the chat!");
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // use strsim::{jaro, jaro_winkler, normalized_damerau_levenshtein, normalized_levenshtein};
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use strsim::{jaro, jaro_winkler, normalized_damerau_levenshtein, normalized_levenshtein};
 
-    // #[test]
-    // fn test_jaro() {
-    //     dbg!(jaro("gptclaud", "claude"));
-    //     dbg!(jaro("claude", "gptclaud"));
+//     #[test]
+//     fn test_jaro() {
+//         dbg!(jaro("gptclaud", "claude"));
+//         dbg!(jaro("claude", "gptclaud"));
 
-    //     dbg!(jaro_winkler("gptclaud", "claude"));
-    //     dbg!(jaro_winkler("claude", "gptclaud"));
+//         dbg!(jaro_winkler("gptclaud", "claude"));
+//         dbg!(jaro_winkler("claude", "gptclaud"));
 
-    //     dbg!(normalized_levenshtein("gptclaud", "claude"));
-    //     dbg!(normalized_levenshtein("claude", "gptclaud"));
-    //     dbg!(normalized_levenshtein("gptclaud", "gpt"));
-    //     dbg!(normalized_levenshtein("gpt", "gptclaud"));
-    //     dbg!(normalized_levenshtein("gpt", "gtp"));
+//         dbg!(normalized_levenshtein("gptclaud", "claude"));
+//         dbg!(normalized_levenshtein("claude", "gptclaud"));
+//         dbg!(normalized_levenshtein("gptclaud", "gpt"));
+//         dbg!(normalized_levenshtein("gpt", "gptclaud"));
+//         dbg!(normalized_levenshtein("gpt", "gtp"));
 
-    //     dbg!(normalized_damerau_levenshtein("gptclaud", "claude"));
-    //     dbg!(normalized_damerau_levenshtein("claude", "gptclaud"));
-    //     dbg!(normalized_damerau_levenshtein("gptclaud", "gpt"));
-    //     dbg!(normalized_damerau_levenshtein("gpt", "gptclaud"));
-    //     dbg!(normalized_damerau_levenshtein("gpt", "gtp"));
-    // }
-}
+//         dbg!(normalized_damerau_levenshtein("gptclaud", "claude"));
+//         dbg!(normalized_damerau_levenshtein("claude", "gptclaud"));
+//         dbg!(normalized_damerau_levenshtein("gptclaud", "gpt"));
+//         dbg!(normalized_damerau_levenshtein("gpt", "gptclaud"));
+//         dbg!(normalized_damerau_levenshtein("gpt", "gtp"));
+//     }
+// }
