@@ -7,6 +7,12 @@ Whilst this client falls under MIT,
 the use of the service falls under duckduckgo's ToS and privacy policy.
 Please see [https://duckduckgo.com/aichat/privacy-terms](https://duckduckgo.com/aichat/privacy-terms) for more details.
 
+## Build Requirements
+Currently uses openssl for TLS, therefor it requires the packages: 
+
+- libssl-dev
+- pkg-config  
+
 ## Usage:
 ```
 ❯ ./target/debug/ddgpt  --help
