@@ -1,17 +1,27 @@
 use std::{
     error::Error,
     io::{BufReader, BufWriter},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 macro_rules! templ_fetch_userdir {
-    ($fn_name:ident, $XDG_VAR_NAME:literal, $DEFAULT_PATH:literal) => {
+    ($fn_name:ident, $XDG_VAR_NAME:literal, $DEFAULT_PATH:literal, $WINDOWS_SUBDIR:literal) => {
+        #[cfg(target_os = "unix")]
         pub fn $fn_name() -> PathBuf {
             user_dir($XDG_VAR_NAME, $DEFAULT_PATH)
+        }
+
+        #[cfg(target_os = "windows")]
+        pub fn $fn_name() -> PathBuf {
+            let mut path = appdata_local_path();
+            path.push(env!("CARGO_PKG_NAME"));
+            path.push($WINDOWS_SUBDIR);
+            path
         }
     };
 }
 
+#[cfg(target_os = "unix")]
 fn user_dir(xdg_variable: &'static str, default_user_dir: &'static str) -> PathBuf {
     let path = std::env::var(xdg_variable)
         .map(|dir| format!("{}/{}", dir, env!("CARGO_PKG_NAME")))
@@ -33,10 +43,61 @@ fn user_dir(xdg_variable: &'static str, default_user_dir: &'static str) -> PathB
     panic!("User environment did not yield sufficient info to determine config-dir");
 }
 
-templ_fetch_userdir!(user_cache_dir, "XDG_CACHE_HOME", "/.cache/");
-templ_fetch_userdir!(user_config_dir, "XDG_CONFIG_HOME", "/.config/");
-templ_fetch_userdir!(user_data_dir, "XDG_DATA_HOME", "/.local/share/");
-templ_fetch_userdir!(user_state_dir, "XDG_STATE_HOME", "/.local/state/");
+#[cfg(windows)]
+fn appdata_roaming_path() -> PathBuf {
+    std::env::var("APPDATA")
+    .map(|dir| PathBuf::from(dir))
+    .or_else(|_| {
+        std::env::var("USERPROFILE").map(|home_dir| {
+            let mut path = PathBuf::from(home_dir);
+            path.push("AppData");
+            path.push("Roaming");
+            path
+        })
+    }).expect("Failed to determine AppData directory!")
+}
+
+#[cfg(windows)]
+fn appdata_local_path() -> PathBuf {
+    std::env::var("LOCALAPPDATA")
+    .map(|dir| PathBuf::from(dir))
+    .or_else(|_| {
+        std::env::var("USERPROFILE").map(|home_dir| {
+            let mut path = PathBuf::from(home_dir);
+            path.push("AppData");
+            path.push("Local");
+            path
+        })
+    }).expect("Failed to determine AppData directory!")
+}
+
+
+#[cfg(target_os = "windows")]
+fn user_dir(xdg_variable: &'static str, default_user_dir: &'static str) -> PathBuf {
+    let path = std::env::var(xdg_variable)
+        .map(|dir| format!("{}/{}", dir, env!("CARGO_PKG_NAME")))
+        .or_else(|_| {
+            std::env::var("HOME").map(|home_dir| {
+                format!(
+                    "{}/{}/{}",
+                    home_dir,
+                    default_user_dir,
+                    env!("CARGO_PKG_NAME")
+                )
+            })
+        });
+
+    if let Ok(path) = path {
+        return PathBuf::from(path);
+    }
+
+    panic!("User environment did not yield sufficient info to determine config-dir");
+}
+
+templ_fetch_userdir!(user_cache_dir, "XDG_CACHE_HOME", "/.cache/", "cache");
+templ_fetch_userdir!(user_config_dir, "XDG_CONFIG_HOME", "/.config/", "config");
+templ_fetch_userdir!(user_data_dir, "XDG_DATA_HOME", "/.local/share/", "data");
+templ_fetch_userdir!(user_state_dir, "XDG_STATE_HOME", "/.local/state/", "state");
 
 // templ_fetch_userdir!(user_cache_dir);
 // templ_fetch_userdir!(user_cache_dir);
@@ -114,29 +175,47 @@ fn write_config_file<T: ConfigLoadable>(
     Ok(())
 }
 
+fn load_config_file<T: ConfigLoadable>(config_path: &Path) -> ConfigResult<T> {
+    Ok(match T::FILETYPE {
+        // #[cfg(predicate)]
+        ConfigFileType::JSON => {
+            let writer = BufReader::new(std::fs::File::open(config_path)?);
+            serde_json::from_reader(writer)?
+        }
+        
+        // #[cfg(predicate)]
+        ConfigFileType::TOML => {
+            toml::from_str(&std::fs::read_to_string(config_path)?)?
+        }
+    })
+    
+}
+
+
 pub trait ConfigLoadable: Default + serde::Serialize + serde::de::DeserializeOwned {
     const FILENAME: &'static str;
     const FILETYPE: ConfigFileType;
 
     fn load() -> ConfigResult<Self> {
-        let path = user_config_dir();
-        let config_path = std::path::Path::new(&path).with_file_name(Self::FILENAME);
+        let mut config_path = user_config_dir();
+        config_path.push(Self::FILENAME);
 
-        let reader = BufReader::new(match std::fs::File::open(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+
+        let val = match load_config_file(&config_path) {
+            Err(ConfigError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 let default_config = Self::default();
                 write_config_file(&config_path, &default_config)?;
                 return Ok(default_config);
             }
-            a => a,
-        }?);
+            val => val,
+        };
 
-        Ok(serde_json::from_reader(reader)?)
+        val
     }
 
     fn save(&self) -> Result<(), ConfigError> {
-        let path = user_config_dir();
-        let config_path = std::path::Path::new(&path).with_file_name(Self::FILENAME);
+        let mut config_path = user_config_dir();
+        config_path.push(Self::FILENAME);
         write_config_file(&config_path, self)
     }
 }
