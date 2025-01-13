@@ -6,7 +6,7 @@ use std::{
 
 macro_rules! templ_fetch_userdir {
     ($fn_name:ident, $XDG_VAR_NAME:literal, $DEFAULT_PATH:literal, $WINDOWS_SUBDIR:literal) => {
-        #[cfg(target_os = "unix")]
+        #[cfg(target_family = "unix")]
         pub fn $fn_name() -> PathBuf {
             user_dir($XDG_VAR_NAME, $DEFAULT_PATH)
         }
@@ -21,7 +21,7 @@ macro_rules! templ_fetch_userdir {
     };
 }
 
-#[cfg(target_os = "unix")]
+#[cfg(target_family = "unix")]
 fn user_dir(xdg_variable: &'static str, default_user_dir: &'static str) -> PathBuf {
     let path = std::env::var(xdg_variable)
         .map(|dir| format!("{}/{}", dir, env!("CARGO_PKG_NAME")))
